@@ -3,6 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# files
+data/
+results/
+results_llm_test/
+figures/
+metrics_summary_qwen25coder7b.csv
+
 # C extensions
 *.so
 
