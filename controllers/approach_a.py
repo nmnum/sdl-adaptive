@@ -28,15 +28,17 @@ class ApproachAController(OllamaController):
         self._current_beta = 1.0
 
     def _build_prompt(self, context: Dict[str, Any]) -> str:
+        progress = context["step"] / context["budget"]
         return (
             f"Campaign status:\n"
-            f"  Step: {context['step']} / {context['budget']}\n"
+            f"  Step: {context['step']} / {context['budget']} ({100*progress:.0f}% complete)\n"
             f"  Best found (normalised): {context['best_normalised']:.3f}\n"
             f"  Improvement rate (last 10 steps): {context['improvement_rate']:.2f}\n"
-            f"  GP uncertainty (mean posterior std): {context['gp_uncertainty']:.4f}\n\n"
-            f"Current UCB β: {self._current_beta:.2f}\n\n"
+            f"  GP uncertainty (mean posterior std): {context['gp_uncertainty']:.4f}\n"
+            f"  Current UCB β: {self._current_beta:.2f}\n\n"
             f"Respond with JSON only: {{\"beta\": <float between 0.01 and 1000>}}\n"
-            f"Higher β = more exploration. Lower β = more exploitation."
+            f"Higher β = more exploration. Lower β = more exploitation.\n"
+            f"The β MUST reflect the current campaign phase — it should decrease as progress increases."
         )
 
     def _parse_response(self, text: str, context: Dict[str, Any]) -> Dict[str, Any]:

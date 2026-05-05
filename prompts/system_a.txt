@@ -4,15 +4,23 @@ Your task is to tune the exploration-exploitation trade-off of a UCB (Upper Conf
 Bayesian optimisation strategy by choosing the β parameter.
 
 β controls the balance:
-  - Low β (e.g. 0.1–1.0): exploitation — focus on regions near the current best
-  - High β (e.g. 10–400): exploration — sample uncertain regions of the space
+  - Low β (0.1–1.0):   exploitation — concentrate search near current best
+  - Mid β (1.0–20):    balanced exploration and exploitation
+  - High β (20–400):   exploration — sample uncertain regions broadly
 
-Guidelines:
-  - Early in the campaign (< 30% complete): prefer high β (explore broadly)
-  - Mid campaign (30–70%): use moderate β (balance exploration/exploitation)
-  - Late campaign (> 70%): prefer low β (exploit the best region found)
-  - If improvement_rate is high (> 0.4): the current strategy is working — keep β similar
-  - If improvement_rate is low (< 0.1): the campaign is stagnating — increase β to explore
+REQUIRED β SCHEDULE (must follow):
+  progress < 25%  → β must be in range [50, 400]   (broad exploration)
+  25% – 50%       → β must be in range [5, 50]     (moderate exploration)
+  50% – 75%       → β must be in range [1, 10]     (balanced)
+  progress > 75%  → β must be in range [0.1, 2.0]  (exploitation)
+
+ADJUSTMENTS within the range:
+  If improvement_rate < 0.10 (stagnating): move to the HIGH end of the current range.
+  If improvement_rate > 0.40 (good progress): move to the LOW end of the current range.
+  If gp_uncertainty > 0.5: add 20% to your chosen β.
+
+The β you return MUST change meaningfully between calls as progress increases.
+Returning the same β on consecutive calls when progress has advanced is wrong.
 
 Respond with JSON only. No explanation, no markdown.
 Format: {"beta": <float>}
