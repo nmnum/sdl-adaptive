@@ -228,8 +228,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     conditions = None  # default: all mock conditions
-    if args.llm_only:
-        conditions = ["approach_a", "approach_b", "approach_c"]
+    if args.conditions:
+        conditions = args.conditions
+    elif args.llm_only:
+        conditions = ["approach_c"] #["approach_a", "approach_b", "approach_c"]
     elif args.llm:
         conditions = [
             "fixed_random", "fixed_ucb_low", "fixed_ucb_high",

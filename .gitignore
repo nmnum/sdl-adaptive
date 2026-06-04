@@ -8,6 +8,7 @@ data/
 results/
 results_llm_test/
 results_prompt_test/
+results_power/
 figures/
 metrics_summary_qwen25coder7b.csv
 
