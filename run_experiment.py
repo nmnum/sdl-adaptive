@@ -221,6 +221,8 @@ if __name__ == "__main__":
                         help="Include real LLM conditions (requires Ollama)")
     parser.add_argument("--llm_only", action="store_true",
                         help="Run only real LLM conditions (merge into existing results)")
+    parser.add_argument("--conditions", nargs="+", default=None,
+                        help="Explicit list of conditions to run, e.g. --conditions fixed_ucb_low fixed_lhs fixed_ei")
     parser.add_argument("--model", default="qwen2.5-coder:7b",
                         help="Ollama model name")
     parser.add_argument("--discrete", action="store_true",
