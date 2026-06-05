@@ -1,20 +1,23 @@
 """
 mid_campaign_analysis.py — Compute mid-campaign regret conditioned on bad starts.
 
-Filters to seeds where best_norm < threshold at step n_init.
-Computes AUC over the mid-campaign window only.
+Filters to seeds where best_norm < threshold at step n_init (these faced a real
+search problem). Computes AUC over the mid-campaign window only.
 
-Can be pointed at a power run (LLM conditions only) alongside the original
-results dir for fixed baselines via --baseline_results_dir.
+Works with any set of conditions present in results_dir — including EGBO,
+novelty_egbo, LLM approaches, and fixed baselines. No hardcoded condition lists.
 
 Usage:
-    # Original full results:
+    # Original results (all conditions in one dir):
     python mid_campaign_analysis.py --results_dir results/ --threshold 0.80
 
-    # Power run (LLM only) with baselines from original run:
-    python mid_campaign_analysis.py \
-        --results_dir results_power/ \
-        --baseline_results_dir results/ \
+    # Shared-seed experiment:
+    python mid_campaign_analysis.py --results_dir results_shared/ --threshold 0.80
+
+    # Power run with baselines from a separate dir:
+    python mid_campaign_analysis.py \\
+        --results_dir results_power/ \\
+        --baseline_results_dir results/ \\
         --threshold 0.80
 """
 
@@ -29,86 +32,110 @@ DATASETS = [
     "coatings", "pareto_20201218", "pareto_20201223",
     "pareto_20210104", "pareto_20210112"
 ]
-LLM_CONDITIONS   = ["approach_a", "approach_b", "approach_c"]
-FIXED_CONDITIONS = [
-    "fixed_random", "fixed_lhs", "fixed_ucb_low",
-    "fixed_ucb_high", "fixed_ei",
-    "mock_approach_a", "mock_approach_b", "mock_approach_c",
-]
-ALL_CONDITIONS = FIXED_CONDITIONS + LLM_CONDITIONS
 
+# Display labels — any condition not listed here gets its raw name
 LABELS = {
-    "fixed_random": "Random",    "fixed_lhs": "LHS",
-    "fixed_ucb_low": "UCB β=0.2", "fixed_ucb_high": "UCB β=400",
-    "fixed_ei": "EI (fixed)",    "mock_approach_a": "Mock-A",
-    "mock_approach_b": "Mock-B", "mock_approach_c": "Mock-C",
-    "approach_a": "LLM-A",       "approach_b": "LLM-B",
-    "approach_c": "LLM-C",
+    "fixed_random":    "Random",
+    "fixed_lhs":       "LHS",
+    "fixed_ucb_low":   "UCB β=0.2",
+    "fixed_ucb_high":  "UCB β=400",
+    "fixed_ei":        "EI (fixed)",
+    "mock_approach_a": "Mock-A",
+    "mock_approach_b": "Mock-B",
+    "mock_approach_c": "Mock-C",
+    "approach_a":      "LLM-A",
+    "approach_b":      "LLM-B",
+    "approach_c":      "LLM-C",
+    "approach_c_evo":  "LLM-C+Evo",
+    "egbo":            "EGBO",
+    "novelty_egbo":    "Novelty-EGBO",
+    "ada_original":    "ADA orig.",
 }
 
+# Condition groups for structured comparisons
+FIXED_GROUP   = {"fixed_random", "fixed_lhs", "fixed_ucb_low",
+                 "fixed_ucb_high", "fixed_ei", "ada_original"}
+MOCK_GROUP    = {"mock_approach_a", "mock_approach_b", "mock_approach_c"}
+LLM_GROUP     = {"approach_a", "approach_b", "approach_c", "approach_c_evo"}
+EGBO_GROUP    = {"egbo", "novelty_egbo"}
 
-def load_curves_norm(cond_dir, global_min, y_range, n_init, window_end):
-    """Load and normalise curves, return (n_seeds, budget) array."""
-    curves_path = cond_dir / "curves.npy"
-    if not curves_path.exists():
+
+def _label(cond):
+    return LABELS.get(cond, cond)
+
+
+def _load_curves_norm(cond_dir, global_min, y_range):
+    p = cond_dir / "curves.npy"
+    if not p.exists():
         return None
-    curves = np.load(curves_path)
-    normed = np.clip((curves - global_min) / y_range, 0, 1)
-    return normed
+    curves = np.load(p)
+    return np.clip((curves - global_min) / y_range, 0, 1)
 
 
-def get_global_stats(ds, results_dir, baseline_dir):
-    """Get global_best and global_min from metrics_summary if available."""
-    for rdir in [results_dir, baseline_dir]:
-        if rdir is None:
+def _get_global_stats(ds, *dirs):
+    """Get global_best and global_min from first available metrics_summary.csv."""
+    for d in dirs:
+        if d is None:
             continue
-        summary = rdir / "metrics_summary.csv"
-        if summary.exists():
-            df = pd.read_csv(summary)
+        s = d / "metrics_summary.csv"
+        if s.exists():
+            df = pd.read_csv(s)
             row = df[df.dataset == ds].head(1)
             if len(row):
-                gb = float(row["global_best"].iloc[0])
-                gm = float(row["global_min"].iloc[0])
-                return gb, gm
-    # Fall back: infer from any available curves + metrics
-    for rdir in [results_dir, baseline_dir]:
-        if rdir is None:
-            continue
-        for cond in ALL_CONDITIONS:
-            mp = rdir / ds / cond / "metrics_per_seed.json"
+                return float(row["global_best"].iloc[0]), float(row["global_min"].iloc[0])
+        # Fall back to per-seed metrics
+        for cond_dir in (d / ds).iterdir() if (d / ds).exists() else []:
+            mp = cond_dir / "metrics_per_seed.json"
             if mp.exists():
                 with open(mp) as f:
                     m = json.load(f)[0]
-                fn = m["final_best_normalised"]
+                fn = m.get("final_best_normalised", 0)
                 if fn and fn > 0:
                     return m["final_best"] / fn, 0.0
     return None, None
+
+
+def _discover_conditions(ds, *dirs):
+    """Find all conditions with curves.npy in any of the given directories."""
+    found = {}  # cond -> path
+    for d in dirs:
+        if d is None or not (d / ds).exists():
+            continue
+        for cond_dir in sorted((d / ds).iterdir()):
+            if cond_dir.is_dir() and (cond_dir / "curves.npy").exists():
+                cond = cond_dir.name
+                if cond not in found:
+                    found[cond] = cond_dir
+    return found
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--results_dir", default="results")
     parser.add_argument("--baseline_results_dir", default=None,
-                        help="Directory with fixed baseline curves (if different from results_dir)")
-    parser.add_argument("--threshold", type=float, default=0.80)
+                        help="Separate dir for baseline conditions (optional)")
+    parser.add_argument("--threshold", type=float, default=0.80,
+                        help="best_norm threshold at step n_init (default 0.80)")
     parser.add_argument("--n_init", type=int, default=5)
-    parser.add_argument("--window_frac", type=float, default=0.5)
+    parser.add_argument("--window_frac", type=float, default=0.5,
+                        help="End of mid-campaign window as fraction of budget")
     args = parser.parse_args()
 
     results_dir  = pathlib.Path(args.results_dir)
-    baseline_dir = pathlib.Path(args.baseline_results_dir) if args.baseline_results_dir else results_dir
+    baseline_dir = (pathlib.Path(args.baseline_results_dir)
+                    if args.baseline_results_dir else None)
 
     print(f"Mid-campaign AUC | threshold={args.threshold} | "
           f"window=steps {args.n_init}–{args.window_frac*100:.0f}% of budget")
-    if baseline_dir != results_dir:
-        print(f"LLM conditions:      {results_dir}")
-        print(f"Baseline conditions: {baseline_dir}")
+    if baseline_dir:
+        print(f"Primary:  {results_dir}")
+        print(f"Baseline: {baseline_dir}")
     print()
 
-    rows = []
+    all_rows = []
 
     for ds in DATASETS:
-        global_best, global_min = get_global_stats(ds, results_dir, baseline_dir)
+        global_best, global_min = _get_global_stats(ds, results_dir, baseline_dir)
         if global_best is None:
             continue
 
@@ -116,109 +143,135 @@ def main():
         if y_range < 1e-9:
             continue
 
-        # Identify qualifying seeds from a reference condition
-        # Use first available condition in either directory
-        ref_curves_norm = None
-        ref_budget = None
-        for rdir in [results_dir, baseline_dir]:
-            for cond in LLM_CONDITIONS + FIXED_CONDITIONS:
-                p = rdir / ds / cond / "curves.npy"
-                if p.exists():
-                    c = np.load(p)
-                    ref_budget = c.shape[1]
-                    ref_curves_norm = np.clip((c - global_min) / y_range, 0, 1)
-                    break
-            if ref_curves_norm is not None:
-                break
-
-        if ref_curves_norm is None:
+        # Discover all available conditions
+        cond_dirs = _discover_conditions(ds, results_dir, baseline_dir)
+        if not cond_dirs:
             continue
 
-        window_end = max(args.n_init + 1, int(args.window_frac * ref_budget))
-        qualifying = [i for i in range(len(ref_curves_norm))
-                      if ref_curves_norm[i, args.n_init] < args.threshold]
+        # Load all condition curves
+        cond_curves = {}
+        budget = None
+        for cond, cdir in cond_dirs.items():
+            cn = _load_curves_norm(cdir, global_min, y_range)
+            if cn is not None:
+                cond_curves[cond] = cn
+                if budget is None:
+                    budget = cn.shape[1]
+
+        if not cond_curves or budget is None:
+            continue
+
+        window_end = max(args.n_init + 1, int(args.window_frac * budget))
+
+        # Identify qualifying seeds using the condition with the most seeds
+        # (for shared-seed experiments all conditions should have identical n_seeds)
+        ref_cond = max(cond_curves, key=lambda c: cond_curves[c].shape[0])
+        ref_curves = cond_curves[ref_cond]
+        qualifying = [i for i in range(len(ref_curves))
+                      if ref_curves[i, args.n_init] < args.threshold]
 
         print(f"{'='*60}")
-        print(f"Dataset: {ds}  (budget={ref_budget})")
+        print(f"Dataset: {ds}  (budget={budget})")
         print(f"  Qualifying seeds (best_norm < {args.threshold} "
-              f"at step {args.n_init}): {len(qualifying)} / {len(ref_curves_norm)}")
+              f"at step {args.n_init}): {len(qualifying)} / {len(ref_curves)}")
 
         if len(qualifying) < 3:
-            print(f"  Too few qualifying seeds — try higher threshold")
+            print(f"  Too few qualifying seeds — try higher --threshold")
             continue
 
-        print(f"\n  {'Condition':<20} {'n':>4} {'mid-AUC':>9} {'±SD':>7}")
-        print(f"  {'-'*44}")
-
+        # Compute mid-campaign AUC for each condition on qualifying seeds
         cond_aucs = {}
-        for cond in ALL_CONDITIONS:
-            # Look in primary results_dir first, then baseline_dir
-            for rdir in [results_dir, baseline_dir]:
-                cn = load_curves_norm(rdir / ds / cond, global_min, y_range,
-                                      args.n_init, window_end)
-                if cn is not None:
-                    break
-            if cn is None:
-                continue
-
-            # Use qualifying seed indices — but cap at available seeds
+        for cond, cn in cond_curves.items():
             q = [i for i in qualifying if i < len(cn)]
             if not q:
                 continue
+            aucs = cn[q, args.n_init:window_end].mean(axis=1)
+            cond_aucs[cond] = aucs
 
-            mid_aucs = cn[q, args.n_init:window_end].mean(axis=1)
-            cond_aucs[cond] = mid_aucs
-            label = LABELS.get(cond, cond)
-            print(f"  {label:<20} {len(mid_aucs):>4} {mid_aucs.mean():>9.3f} "
-                  f"{mid_aucs.std():>7.3f}")
-            rows.append({
-                "dataset": ds, "condition": cond, "label": label,
-                "n_qualifying": len(mid_aucs),
-                "mid_auc_mean": float(mid_aucs.mean()),
-                "mid_auc_std":  float(mid_aucs.std()),
+        # Sort by mean AUC descending
+        sorted_conds = sorted(cond_aucs, key=lambda c: -cond_aucs[c].mean())
+
+        print(f"\n  {'Condition':<22} {'n':>4} {'mid-AUC':>9} {'±SD':>7}  group")
+        print(f"  {'-'*55}")
+        for cond in sorted_conds:
+            aucs = cond_aucs[cond]
+            grp = ("fixed" if cond in FIXED_GROUP else
+                   "mock"  if cond in MOCK_GROUP  else
+                   "LLM"   if cond in LLM_GROUP   else
+                   "EGBO"  if cond in EGBO_GROUP  else "other")
+            print(f"  {_label(cond):<22} {len(aucs):>4} {aucs.mean():>9.3f} "
+                  f"{aucs.std():>7.3f}  {grp}")
+            all_rows.append({
+                "dataset": ds, "condition": cond, "label": _label(cond),
+                "n_qualifying": len(aucs),
+                "mid_auc_mean": float(aucs.mean()),
+                "mid_auc_std":  float(aucs.std()),
                 "threshold": args.threshold,
             })
 
-        # Statistical tests: each LLM vs best available fixed baseline
-        print(f"\n  Statistical tests (paired on qualifying seeds):")
+        # ── Statistical tests ─────────────────────────────────────────────
+        print(f"\n  Statistical tests (two-sample t-test on qualifying seeds):")
 
-        best_fixed = max(
-            [(c, cond_aucs[c].mean()) for c in FIXED_CONDITIONS if c in cond_aucs],
-            key=lambda x: x[1], default=(None, None)
-        )
-        if best_fixed[0]:
-            print(f"  Best fixed baseline: {LABELS[best_fixed[0]]} "
-                  f"(mean={best_fixed[1]:.3f})")
+        # 1. Each condition vs the best fixed baseline
+        fixed_present = {c: cond_aucs[c] for c in cond_aucs if c in FIXED_GROUP}
+        if fixed_present:
+            best_fixed_name = max(fixed_present, key=lambda c: fixed_present[c].mean())
+            best_fixed_aucs = fixed_present[best_fixed_name]
+            print(f"  Best fixed baseline: {_label(best_fixed_name)} "
+                  f"(mean={best_fixed_aucs.mean():.3f})")
+            for cond in sorted_conds:
+                if cond in FIXED_GROUP:
+                    continue
+                aucs = cond_aucs[cond]
+                n = min(len(aucs), len(best_fixed_aucs))
+                t, p = stats.ttest_ind(aucs[:n], best_fixed_aucs[:n])
+                delta = aucs.mean() - best_fixed_aucs.mean()
+                sig = " *" if p < 0.05 else "  "
+                print(f"    {_label(cond):<22} vs {_label(best_fixed_name):<12} "
+                      f"Δ={delta:+.3f} p={p:.3f}{sig}")
 
-        for llm_cond in LLM_CONDITIONS:
-            if llm_cond not in cond_aucs:
-                continue
-            llm_aucs = cond_aucs[llm_cond]
+        # 2. EGBO variants vs LLM-C (the key comparison)
+        egbo_present = {c: cond_aucs[c] for c in cond_aucs if c in EGBO_GROUP}
+        llm_present  = {c: cond_aucs[c] for c in cond_aucs if c in LLM_GROUP}
+        if egbo_present and llm_present:
+            print(f"\n  EGBO vs LLM approaches:")
+            for ec, ea in sorted(egbo_present.items(),
+                                  key=lambda x: -x[1].mean()):
+                for lc, la in sorted(llm_present.items(),
+                                      key=lambda x: -x[1].mean()):
+                    n = min(len(ea), len(la))
+                    t, p = stats.ttest_ind(ea[:n], la[:n])
+                    delta = ea.mean() - la.mean()
+                    sig = " *" if p < 0.05 else "  "
+                    print(f"    {_label(ec):<22} vs {_label(lc):<14} "
+                          f"Δ={delta:+.3f} p={p:.3f}{sig}")
 
-            # vs best fixed
-            if best_fixed[0] and best_fixed[0] in cond_aucs:
-                fix_aucs = cond_aucs[best_fixed[0]]
-                n = min(len(llm_aucs), len(fix_aucs))
-                t, p = stats.ttest_ind(llm_aucs[:n], fix_aucs[:n])
-                sig = " *" if p < 0.05 else ""
-                print(f"    {LABELS[llm_cond]} vs {LABELS[best_fixed[0]]}: "
-                      f"Δ={llm_aucs.mean()-fix_aucs.mean():+.3f}, p={p:.3f}{sig}")
+        # 3. novelty_egbo vs egbo (within-EGBO)
+        if "novelty_egbo" in cond_aucs and "egbo" in cond_aucs:
+            na, ea = cond_aucs["novelty_egbo"], cond_aucs["egbo"]
+            n = min(len(na), len(ea))
+            t, p = stats.ttest_ind(na[:n], ea[:n])
+            delta = na.mean() - ea.mean()
+            sig = " *" if p < 0.05 else "  "
+            print(f"\n  Within-EGBO:")
+            print(f"    Novelty-EGBO vs EGBO           "
+                  f"Δ={delta:+.3f} p={p:.3f}{sig}")
 
-        # LLM pairwise
-        llm_present = [c for c in LLM_CONDITIONS if c in cond_aucs]
-        if len(llm_present) >= 2:
-            print(f"  LLM pairwise:")
-            for i, c1 in enumerate(llm_present):
-                for c2 in llm_present[i+1:]:
-                    a1, a2 = cond_aucs[c1], cond_aucs[c2]
-                    n = min(len(a1), len(a2))
-                    t, p = stats.ttest_ind(a1[:n], a2[:n])
-                    sig = " *" if p < 0.05 else ""
-                    print(f"    {LABELS[c1]} vs {LABELS[c2]}: "
-                          f"Δ={a1.mean()-a2.mean():+.3f}, p={p:.3f}{sig}")
+        # 4. LLM-C+Evo vs LLM-C (effect of adding evolutionary candidates)
+        if "approach_c_evo" in cond_aucs and "approach_c" in cond_aucs:
+            ae, ac = cond_aucs["approach_c_evo"], cond_aucs["approach_c"]
+            n = min(len(ae), len(ac))
+            t, p = stats.ttest_ind(ae[:n], ac[:n])
+            delta = ae.mean() - ac.mean()
+            sig = " *" if p < 0.05 else "  "
+            print(f"\n  Effect of evolutionary candidates on LLM-C:")
+            print(f"    LLM-C+Evo vs LLM-C             "
+                  f"Δ={delta:+.3f} p={p:.3f}{sig}")
+
         print()
 
-    out_df = pd.DataFrame(rows)
+    # Save and summarise
+    out_df = pd.DataFrame(all_rows)
     out_path = results_dir / "mid_campaign_conditioned.csv"
     out_df.to_csv(out_path, index=False)
     print(f"Saved: {out_path}")
@@ -229,9 +282,16 @@ def main():
         print(f"{'='*60}")
         summary = (out_df.groupby("label")["mid_auc_mean"]
                    .mean().sort_values(ascending=False))
+        grp_map = {_label(c): (
+            "EGBO"  if c in EGBO_GROUP  else
+            "LLM"   if c in LLM_GROUP   else
+            "mock"  if c in MOCK_GROUP  else
+            "fixed" if c in FIXED_GROUP else "other")
+            for c in LABELS}
         for label, mean in summary.items():
-            marker = " ◄" if label.startswith("LLM") else ""
-            print(f"  {label:<20} {mean:.3f}{marker}")
+            grp = grp_map.get(label, "other")
+            marker = " ◄" if grp in ("LLM", "EGBO") else ""
+            print(f"  {label:<22} {mean:.3f}  [{grp}]{marker}")
 
 
 if __name__ == "__main__":
