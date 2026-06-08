@@ -9,40 +9,54 @@ REQUIREMENTS:
 3. y_obs is a (n,) numpy array of observed outputs (higher is better)
 4. bounds is a (d, 2) numpy array of [min, max] per dimension
 5. Return a (d,) numpy array within bounds
-6. You must include all necessary imports (e.g., numpy (as no), sklearn.gaussian_process).
+6. You must include all necessary imports
 7. NO network access, NO file I/O, NO subprocess calls
 8. The code will be executed with a 30-second timeout
 
-CRITICAL IMPLEMENTATION RULES (violations will cause a runtime crash):
-1. suggest() must return ONE point in the FULL d-dimensional space — shape (d,).
-2. When using scipy.optimize.minimize, x0 MUST be a 1D array of shape (d,), never a scalar.
-   WRONG:  minimize(obj, bounds[i, 0], ...)          # scalar — crashes
-   CORRECT: x0 = np.array([(lo+hi)/2 for lo,hi in bounds])
-            minimize(obj, x0, bounds=list(zip(bounds[:,0], bounds[:,1])))
-3. When calling gp.predict(x), x must have shape (1, d).
-   CORRECT: gp.predict(x.reshape(1, -1))
-4. Do NOT optimise each dimension independently in a loop — optimise all d dimensions jointly.
-5. Prefer a random candidate grid (200–500 points) over scipy.optimize for acquisition maximisation.
-   The ONLY correct pattern is:
+PRE-BUILT UTILITY AVAILABLE (import and use directly):
+    from evolutionary_candidates import evolutionary_candidates, novelty_select
 
-   # Build candidates: shape (300, d)
-   candidates = np.column_stack([np.random.uniform(lo, hi, 300) for lo, hi in bounds])
+evolutionary_candidates(X_obs, y_obs, bounds, n=72) -> np.ndarray of shape (n, d)
+    Generates n diverse candidate points using U-NSGA-III evolutionary search.
+    Seeded from the best observed points. Falls back to LHS if unavailable.
+    USE THIS when you need a diverse pool of candidates covering the input space,
+    especially in mid-to-late campaign when pure acquisition would over-exploit.
 
-   # Score ALL candidates at once — pass the full (300, d) array directly to gp.predict:
-   mu, sigma = gp.predict(candidates, return_std=True)   # mu shape: (300,)
-   acquisition_scores = mu + beta * sigma                 # shape: (300,)
-   return candidates[np.argmax(acquisition_scores)]       # shape: (d,)
+novelty_select(candidates, X_obs, bounds, acq_scores, merit_weight=0.7) -> int
+    Returns the index of the best candidate using novelty-aware scoring:
+    score = 0.7 * acquisition_merit + 0.3 * novelty (distance from observed points)
+    USE THIS to select from a merged pool of acquisition + evolutionary candidates.
 
-   NEVER wrap gp.predict in a helper that calls x.reshape(1, -1) and then pass the full
-   candidate array to that helper — reshape(1, -1) on a (300, d) array gives (1, 300*d)
-   which crashes with "X has 1200 features, but GaussianProcessRegressor is expecting 4".
+RECOMMENDED PATTERN for mid-to-late campaign (n_obs > d+5):
+    # 1. Generate evolutionary candidates for diversity
+    evo_cands = evolutionary_candidates(X_obs, y_obs, bounds, n=72)
+
+    # 2. Generate GP-based candidates for exploitation
+    gp_cands = <your GP acquisition candidates, shape (n_acq, d)>
+
+    # 3. Merge pools
+    all_cands = np.vstack([gp_cands, evo_cands])
+
+    # 4. Score merged pool with acquisition function
+    acq_scores = <score each candidate with your acquisition function>
+
+    # 5. Select best candidate with novelty awareness
+    best_idx = novelty_select(all_cands, X_obs, bounds, acq_scores, merit_weight=0.7)
+    return all_cands[best_idx]
+
+CRITICAL IMPLEMENTATION RULES:
+1. suggest() must return ONE point of shape (d,) — never None
+2. Always initialise a fallback random point before any GP logic
+3. For GP candidates: build candidates as shape (n, d) and pass directly to gp.predict()
+   CORRECT: candidates = np.column_stack([np.random.uniform(lo, hi, 300) for lo, hi in bounds])
+            mu, sigma = gp.predict(candidates, return_std=True)  # mu shape: (300,)
+4. normalize_y=True in GaussianProcessRegressor is critical for large-valued outputs
 
 STRATEGY GUIDELINES:
-- Early campaign (< 30% complete, few observations): use space-filling or random sampling
-- Mid campaign (30–70%): use GP-based acquisition (UCB, EI) — sklearn GaussianProcessRegressor
-- Late campaign (> 70%): use exploitation-focused acquisition (EI with low noise, PI)
-- If stagnating (improvement_rate < 0.1): add diversity (Thompson sampling, random restarts)
-- Always handle edge cases: n < d+1 (too few points for GP), numerical instability
+- Early campaign (n < d+2): use random or LHS only, no GP
+- Mid campaign: use GP acquisition (UCB, EI) merged with evolutionary_candidates
+- Late campaign: use novelty_select with merit_weight=0.7 to avoid re-sampling
+- Stagnating (improvement_rate < 0.1): increase evolutionary diversity
 
 Return ONLY valid Python code. No markdown fences, no explanation.
 The code must be a complete, self-contained Python module.

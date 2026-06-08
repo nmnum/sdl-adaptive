@@ -262,7 +262,16 @@ def run_egbo_campaign(oracle, X_init, y_init, budget, batch_size=4,
                               xl=np.zeros(d), xu=np.ones(d))
             algo.setup(pm, termination=NoTermination())
             pop = algo.ask()
-            pop.set("F", -train_y[top_idx].cpu().numpy())
+            # Set F to match actual population size (may differ from evo_candidates)
+            pop_size_actual = len(pop)
+            f_seed = train_y.squeeze(-1).argsort(descending=True)
+            f_vals = -train_y[f_seed].cpu().numpy()
+            if len(f_vals) >= pop_size_actual:
+                pop.set("F", f_vals[:pop_size_actual].reshape(-1, 1))
+            else:
+                # Pad with worst observed value
+                pad = np.full((pop_size_actual - len(f_vals), 1), f_vals[-1])
+                pop.set("F", np.vstack([f_vals.reshape(-1,1), pad]))
             algo.tell(infills=pop)
             ea_x_norm = torch.tensor(algo.ask().get("X"), **tkwargs)
         except Exception:
@@ -335,7 +344,7 @@ def run_egbo_campaign(oracle, X_init, y_init, budget, batch_size=4,
 
 # ── SDL controller factory ────────────────────────────────────────────────────
 
-def make_controller(condition, model="qwen2.5-coder:7b"):
+def make_controller(condition, model="qwen2.5-coder:7b", ds_label="unknown"):
     from controllers.mock_controller import MockApproachBController
     if condition == "fixed_random":    return FixedStrategyBaseline("random", {})
     if condition == "fixed_lhs":       return FixedStrategyBaseline("lhs", {})
@@ -351,7 +360,12 @@ def make_controller(condition, model="qwen2.5-coder:7b"):
         return ApproachBController(model=model)
     if condition == "approach_c":
         from controllers.approach_c import ApproachCController
-        return ApproachCController(model=model)
+        return ApproachCController(model=model,
+                                   code_log_dir=f"./approach_c_logs_{ds_label}")
+    if condition == "approach_c_evo":
+        from controllers.approach_c import ApproachCEvoController
+        return ApproachCEvoController(model=model,
+                                      code_log_dir=f"./approach_c_evo_logs_{ds_label}")
     raise ValueError(f"Unknown condition: {condition!r}")
 
 
@@ -524,7 +538,7 @@ def main():
 
             for rep_idx, (X_init, y_init) in enumerate(shared_inits):
                 try:
-                    ctrl = make_controller(condition, args.model)
+                    ctrl = make_controller(condition, args.model, ds_label)
                 except Exception as e:
                     logger.warning(f"Skip {condition} rep {rep_idx}: {e}")
                     continue
