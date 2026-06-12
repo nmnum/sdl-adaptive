@@ -213,20 +213,24 @@ class CampaignSimulator:
         needs_gp = getattr(controller, "_needs_gp_uncertainty", False)
 
         if needs_gp:
-            gp_uncertainty = self._estimate_gp_uncertainty(X_obs, y_obs, bounds)
+            gp_uncertainty, lengthscale_norm = self._estimate_gp_uncertainty(
+                X_obs, y_obs, bounds)
         else:
             # Cheap proxy: normalised std of observed y
             y_range = y_obs.max() - y_obs.min() + 1e-12
             gp_uncertainty = float(y_obs.std() / y_range)
+            lengthscale_norm = 0.5  # unknown — use neutral value
 
         return {
             "step": step,
             "budget": self.budget,
             "n_obs": len(y_obs),
+            "n_dims": bounds.shape[0],
             "best_so_far": float(y_obs.max()),
             "best_normalised": float(y_obs.max() / (self.oracle.global_best() + 1e-12)),
             "improvement_rate": self._improvement_rate(y_obs),
             "gp_uncertainty": gp_uncertainty,
+            "lengthscale_norm": lengthscale_norm,
             "dataset": self.dataset_name,
             "X_obs": X_obs,
             "y_obs": y_obs,
@@ -248,8 +252,18 @@ class CampaignSimulator:
     def _estimate_gp_uncertainty(
         X_obs: np.ndarray, y_obs: np.ndarray, bounds: np.ndarray,
         n_test: int = 100,
-    ) -> float:
-        """Mean GP posterior std over random test points (expensive — lazy)."""
+    ) -> tuple:
+        """Mean GP posterior std and normalised lengthscale over random test points.
+
+        Returns
+        -------
+        (gp_uncertainty, lengthscale_norm) : (float, float)
+            gp_uncertainty  — mean posterior std over n_test random points
+            lengthscale_norm — fitted Matern lengthscale / mean domain width,
+                               in original input space (not scaled space).
+                               High (>0.30) = smooth landscape, GP informative.
+                               Low (<0.15)  = rough/flat landscape, GP unreliable.
+        """
         import warnings
         from sklearn.gaussian_process import GaussianProcessRegressor
         from sklearn.gaussian_process.kernels import Matern
@@ -271,4 +285,13 @@ class CampaignSimulator:
             np.random.uniform(bounds[i, 0], bounds[i, 1], n_test) for i in range(d)
         ])
         _, sigma = gp.predict(scaler.transform(test_pts), return_std=True)
-        return float(sigma.mean())
+
+        # Lengthscale in original space: ls_scaled * mean(scaler.scale_)
+        ls_scaled = float(gp.kernel_.length_scale)
+        mean_scale = float(scaler.scale_.mean())
+        mean_domain_width = float((bounds[:, 1] - bounds[:, 0]).mean())
+        ls_original = ls_scaled * mean_scale
+        lengthscale_norm = ls_original / (mean_domain_width + 1e-12)
+        lengthscale_norm = float(np.clip(lengthscale_norm, 0.0, 10.0))
+
+        return float(sigma.mean()), lengthscale_norm

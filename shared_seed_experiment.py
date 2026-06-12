@@ -57,6 +57,8 @@ ALL_DATASETS = [
     ("pareto_20201223", "pareto_campaign 2020-12-23_17-06-50"),
     ("pareto_20210104", "pareto_campaign 2021-01-04_08-37-39"),
     ("pareto_20210112", "pareto_campaign 2021-01-12_16-26-56"),
+    ("hartmann3",       "hartmann3"),
+    ("hartmann6",       "hartmann6"),
 ]
 
 DEFAULT_CONDITIONS = [
@@ -366,6 +368,12 @@ def make_controller(condition, model="qwen2.5-coder:7b", ds_label="unknown"):
         from controllers.approach_c import ApproachCEvoController
         return ApproachCEvoController(model=model,
                                       code_log_dir=f"./approach_c_evo_logs_{ds_label}")
+    if condition == "rule_router":
+        from controllers.rule_router import RuleRouterController
+        return RuleRouterController()
+    if condition == "approach_d":
+        from controllers.approach_d import ApproachDController
+        return ApproachDController(model=model)
     raise ValueError(f"Unknown condition: {condition!r}")
 
 
@@ -394,12 +402,16 @@ def _improvement_rate(y_obs, window=10):
 
 
 def _gp_uncertainty(X_obs, y_obs, bounds, n_test=80):
+    """Returns (gp_uncertainty, lengthscale_norm) tuple."""
     from sklearn.gaussian_process import GaussianProcessRegressor
     from sklearn.gaussian_process.kernels import Matern
     from sklearn.preprocessing import StandardScaler
     scaler = StandardScaler()
     X_s = scaler.fit_transform(X_obs)
-    gp = GaussianProcessRegressor(kernel=Matern(nu=2.5), alpha=1e-6, normalize_y=True)
+    gp = GaussianProcessRegressor(
+        kernel=Matern(nu=2.5, length_scale_bounds=(1e-3, 1e3)),
+        alpha=1e-6, normalize_y=True,
+    )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         gp.fit(X_s, y_obs)
@@ -407,7 +419,12 @@ def _gp_uncertainty(X_obs, y_obs, bounds, n_test=80):
     pts = np.column_stack([np.random.uniform(bounds[i, 0], bounds[i, 1], n_test)
                            for i in range(d)])
     _, sigma = gp.predict(scaler.transform(pts), return_std=True)
-    return float(sigma.mean())
+    # Extract normalised lengthscale
+    ls_scaled = float(gp.kernel_.length_scale)
+    mean_scale = float(scaler.scale_.mean())
+    mean_domain = float((bounds[:, 1] - bounds[:, 0]).mean())
+    ls_norm = float(np.clip(ls_scaled * mean_scale / (mean_domain + 1e-12), 0, 10))
+    return float(sigma.mean()), ls_norm
 
 
 def run_sdl_campaign(oracle, ds_name, X_init, y_init, controller,
@@ -428,14 +445,19 @@ def run_sdl_campaign(oracle, ds_name, X_init, y_init, controller,
     for step in range(n_init, budget):
         if (step - n_init) % controller_interval == 0:
             needs_gp = getattr(controller, "_needs_gp_uncertainty", False)
-            gp_unc = (_gp_uncertainty(X_obs, y_obs, bounds) if needs_gp
-                      else float(y_obs.std() / (y_obs.max() - y_obs.min() + 1e-12)))
+            if needs_gp:
+                gp_unc, ls_norm = _gp_uncertainty(X_obs, y_obs, bounds)
+            else:
+                gp_unc = float(y_obs.std() / (y_obs.max() - y_obs.min() + 1e-12))
+                ls_norm = 0.5  # neutral — GP not fitted
             context = {
                 "step": step, "budget": budget, "n_obs": len(y_obs),
+                "n_dims": bounds.shape[0],
                 "best_so_far": float(y_obs.max()),
                 "best_normalised": float(y_obs.max() / (oracle.global_best() + 1e-12)),
                 "improvement_rate": _improvement_rate(y_obs),
                 "gp_uncertainty": gp_unc,
+                "lengthscale_norm": ls_norm,
                 "dataset": ds_name, "X_obs": X_obs, "y_obs": y_obs, "bounds": bounds,
             }
             try:

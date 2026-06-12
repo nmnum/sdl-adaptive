@@ -74,7 +74,23 @@ class NNOracle:
             csv_path = data_dir / f"{stem}.csv"
             return cls._from_pareto(csv_path)
 
+        # Synthetic benchmarks — generic CSV with x0,x1,...,y columns
+        if dataset_name in ("hartmann3", "hartmann6", "branin"):
+            csv_path = data_dir / f"{dataset_name}.csv"
+            return cls._from_synthetic(csv_path)
+
         raise ValueError(f"Unknown dataset: {dataset_name!r}")
+
+    @classmethod
+    def _from_synthetic(cls, csv_path: pathlib.Path) -> "NNOracle":
+        """Load a synthetic benchmark oracle from CSV (x0, x1, ..., y columns)."""
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        y_col = "y"
+        x_cols = [c for c in df.columns if c != y_col]
+        X = df[x_cols].values.astype(float)
+        y = df[y_col].values.astype(float)
+        return cls(X, y)
 
     @classmethod
     def _from_coatings(cls, csv_path: pathlib.Path) -> "NNOracle":

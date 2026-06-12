@@ -30,7 +30,7 @@ from scipy import stats
 
 DATASETS = [
     "coatings", "pareto_20201218", "pareto_20201223",
-    "pareto_20210104", "pareto_20210112"
+    "pareto_20210104", "pareto_20210112", "hartmann3", "hartmann6"
 ]
 
 # Display labels — any condition not listed here gets its raw name
