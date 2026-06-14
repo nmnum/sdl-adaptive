@@ -153,32 +153,40 @@ def run_egbo_configurable(
         return gp, sc
 
     def _get_candidates(X_obs_norm, y_obs_local, rng_state):
-        # EA candidates
-        top_k = min(ea_candidates, len(y_obs_local))
-        top_idx = np.argsort(y_obs_local)[-top_k:][::-1]
-        seed_x = X_obs_norm[top_idx]
-        if seed_x.shape[0] < ea_candidates:
-            pad = np.random.default_rng(rng_state).random(
-                (ea_candidates - seed_x.shape[0], d))
-            seed_x = np.vstack([seed_x, pad])
-        try:
-            ref_dirs = get_reference_directions("energy", 1, ea_candidates, seed=rng_state)
-            algo = UNSGA3(pop_size=ea_candidates, ref_dirs=ref_dirs, sampling=seed_x)
-            pm = PymooProblem(n_var=d, n_obj=1, n_constr=0,
-                              xl=np.zeros(d), xu=np.ones(d))
-            algo.setup(pm, termination=NoTermination())
-            pop = algo.ask()
-            n_act = len(pop)
-            f_vals = -y_obs_local[np.argsort(y_obs_local)[-n_act:]]
-            pop.set("F", f_vals.reshape(-1, 1))
-            algo.tell(infills=pop)
-            ea_cands = np.clip(algo.ask().get("X"), 0, 1)
-        except Exception:
-            ea_cands = np.random.default_rng(rng_state).random((ea_candidates, d))
+        rng = np.random.default_rng(rng_state)
+
+        # EA candidates — skip NSGA-III if ea_candidates < 2 (pymoo requirement)
+        if ea_candidates >= 2:
+            top_k = min(ea_candidates, len(y_obs_local))
+            top_idx = np.argsort(y_obs_local)[-top_k:][::-1]
+            seed_x = X_obs_norm[top_idx]
+            if seed_x.shape[0] < ea_candidates:
+                pad = rng.random((ea_candidates - seed_x.shape[0], d))
+                seed_x = np.vstack([seed_x, pad])
+            try:
+                # pop_size must be >= n_ref_dirs (always 1 for single-obj)
+                pop_size = max(ea_candidates, 2)
+                ref_dirs = get_reference_directions("energy", 1, pop_size, seed=rng_state)
+                algo = UNSGA3(pop_size=pop_size, ref_dirs=ref_dirs, sampling=seed_x)
+                pm = PymooProblem(n_var=d, n_obj=1, n_constr=0,
+                                  xl=np.zeros(d), xu=np.ones(d))
+                algo.setup(pm, termination=NoTermination())
+                pop = algo.ask()
+                n_act = len(pop)
+                f_vals = -y_obs_local[np.argsort(y_obs_local)[-n_act:]]
+                pop.set("F", f_vals.reshape(-1, 1))
+                algo.tell(infills=pop)
+                ea_cands = np.clip(algo.ask().get("X"), 0, 1)[:ea_candidates]
+            except Exception:
+                ea_cands = rng.random((ea_candidates, d))
+        else:
+            ea_cands = np.zeros((0, d))  # no EA candidates
 
         # BO candidates (random grid — acquisition scores them)
-        bo_cands = np.random.default_rng(rng_state + 1000).random((bo_candidates, d))
-        return np.vstack([ea_cands, bo_cands]) if bo_candidates > 0 else ea_cands
+        bo_cands = rng.random((bo_candidates, d)) if bo_candidates > 0 else np.zeros((0, d))
+
+        parts = [p for p in [ea_cands, bo_cands] if len(p) > 0]
+        return np.vstack(parts) if parts else rng.random((8, d))
 
     for batch_idx in range(n_batches):
         X_obs_norm = norm(X_obs)
@@ -379,7 +387,10 @@ def main():
             else:
                 pool_size = cond["pool_size"]
                 ea_ratio  = cond["ea_ratio"]
-                ea_n = max(0, int(ea_ratio * pool_size))
+                # ea_n=0 is valid (pure BO); ea_n=1 would cause pymoo pop_size warning
+                # so snap to 0 or >=2
+                ea_n_raw = int(ea_ratio * pool_size)
+                ea_n = 0 if ea_n_raw < 2 else ea_n_raw
                 bo_n = max(0, pool_size - ea_n)
                 kwargs = {
                     "batch_size": 4, "re_fit_gp": False,
