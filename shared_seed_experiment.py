@@ -428,8 +428,15 @@ def _gp_uncertainty(X_obs, y_obs, bounds, n_test=80):
 
 
 def run_sdl_campaign(oracle, ds_name, X_init, y_init, controller,
-                     budget, controller_interval=5):
-    """Run one SDL campaign from pre-specified initial points."""
+                     budget, controller_interval=5, first_control_step=None):
+    """
+    Run one SDL campaign from pre-specified initial points.
+
+    first_control_step: step at which the controller first fires.
+      Steps from n_init to first_control_step-1 run LHS regardless.
+      At first_control_step, GP trust diagnostic runs; if trust_flag=="distrust",
+      overrides to LHS. Default: n_init (fires immediately, original behaviour).
+    """
     from strategies import STRATEGY_MAP
     bounds = oracle.bounds()
     d = bounds.shape[0]
@@ -439,17 +446,34 @@ def run_sdl_campaign(oracle, ds_name, X_init, y_init, controller,
     y_obs = y_init.copy()
     running_best = [float(y_obs.max())] * n_init
     decisions, failures = [], []
-    current_strategy, current_params = "random", {}
+    current_strategy, current_params = "lhs", {}
     x_next_custom = None
 
+    if first_control_step is None:
+        first_control_step = n_init
+    first_control_step = max(first_control_step, n_init)
+
     for step in range(n_init, budget):
-        if (step - n_init) % controller_interval == 0:
+        controller_active = (step >= first_control_step)
+        if controller_active and (step - first_control_step) % controller_interval == 0:
             needs_gp = getattr(controller, "_needs_gp_uncertainty", False)
             if needs_gp:
                 gp_unc, ls_norm = _gp_uncertainty(X_obs, y_obs, bounds)
             else:
                 gp_unc = float(y_obs.std() / (y_obs.max() - y_obs.min() + 1e-12))
-                ls_norm = 0.5  # neutral — GP not fitted
+                ls_norm = 0.5
+
+            # GP trust diagnostic at first_control_step
+            trust_score, trust_flag = None, None
+            if step == first_control_step:
+                try:
+                    from gp_trust_check import gp_trust_check as _trust_check
+                    _tr = _trust_check(X_obs, y_obs, bounds)
+                    trust_score = _tr.trust_score
+                    trust_flag  = _tr.trust_flag
+                except Exception:
+                    pass
+
             context = {
                 "step": step, "budget": budget, "n_obs": len(y_obs),
                 "n_dims": bounds.shape[0],
@@ -458,12 +482,19 @@ def run_sdl_campaign(oracle, ds_name, X_init, y_init, controller,
                 "improvement_rate": _improvement_rate(y_obs),
                 "gp_uncertainty": gp_unc,
                 "lengthscale_norm": ls_norm,
+                "trust_score": trust_score,
+                "trust_flag":  trust_flag,
                 "dataset": ds_name, "X_obs": X_obs, "y_obs": y_obs, "bounds": bounds,
             }
-            try:
-                decision = controller.decide(context)
-            except Exception:
-                decision = {"strategy": current_strategy, "params": current_params}
+
+            # Override to LHS if GP is distrusted at first routing decision
+            if trust_flag == "distrust":
+                decision = {"strategy": "lhs", "params": {}}
+            else:
+                try:
+                    decision = controller.decide(context)
+                except Exception:
+                    decision = {"strategy": current_strategy, "params": current_params}
 
             s = decision.get("strategy", current_strategy)
             p = decision.get("params", current_params)
@@ -471,6 +502,9 @@ def run_sdl_campaign(oracle, ds_name, X_init, y_init, controller,
             if s in STRATEGY_MAP or s == "_custom":
                 current_strategy, current_params = s, p
             decisions.append((step, current_strategy, {**current_params}))
+
+        if not controller_active:
+            current_strategy, current_params = "lhs", {}
 
         try:
             if current_strategy == "_custom" and x_next_custom is not None:
@@ -512,6 +546,10 @@ def main():
                         help="Batch size for EGBO conditions (default 4)")
     parser.add_argument("--egbo_evo_candidates", type=int, default=72,
                         help="U-NSGA-III population size per batch (default 72)")
+    parser.add_argument("--first_control_step", type=int, default=None,
+                        help="Step at which controller first fires (default: n_init). "
+                             "Steps before this run LHS. "
+                             "GP trust check runs at this step.")
     args = parser.parse_args()
 
     data_dir = pathlib.Path(args.data_dir)
@@ -565,8 +603,11 @@ def main():
                     logger.warning(f"Skip {condition} rep {rep_idx}: {e}")
                     continue
 
-                res = run_sdl_campaign(oracle, ds_name, X_init, y_init,
-                                       ctrl, budget, controller_interval=5)
+                res = run_sdl_campaign(
+                    oracle, ds_name, X_init, y_init, ctrl, budget,
+                    controller_interval=5,
+                    first_control_step=args.first_control_step,
+                )
 
                 # Save generated code for approach_c analysis
                 if condition == "approach_c" and hasattr(ctrl, "_current_code"):
